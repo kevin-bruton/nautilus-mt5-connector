@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import MetaTrader5 as mt5
 
@@ -56,6 +56,7 @@ from nautilus_trader.execution.messages import (
     CancelOrder,
     ModifyOrder,
     SubmitOrder,
+    SubmitOrderList,
 )
 from nautilus_trader.execution.reports import (
     FillReport,
@@ -347,120 +348,304 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         On success: emits OrderAccepted (pending/stop) or OrderFilled (market).
         On failure: emits OrderRejected.
         """
-        order  = command.order
+        await self._submit_single_order(command.order)
+
+    async def _submit_order_list(self, command: SubmitOrderList) -> None:
+        """
+        Submit a supported Nautilus order list to MT5.
+
+        Supported shape:
+          - one MARKET entry order
+          - optional STOP_MARKET child for stop loss
+          - optional LIMIT child for take profit
+
+        The supported shape is translated to one MT5 request using native
+        broker-side ``sl`` and ``tp`` fields on the entry order.
+        """
+        order_list = command.order_list
+        orders = list(order_list.orders)
+        if not orders:
+            self._log.warning("MT5LiveExecutionClient: empty order list rejected")
+            return
+
+        entry_order, sl_price, tp_price, reason = self._extract_simple_bracket(
+            orders,
+        )
+        if reason is not None:
+            self._reject_orders(orders, reason)
+            return
+
+        await self._submit_single_order(
+            entry_order,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            reject_orders=orders,
+        )
+
+    async def _submit_single_order(
+        self,
+        order: Any,
+        sl_price: float | None = None,
+        tp_price: float | None = None,
+        reject_orders: list[Any] | None = None,
+    ) -> None:
+        """
+        Submit one MT5 order, optionally overriding its broker-side SL/TP.
+
+        ``reject_orders`` lets an order-list submission reject every Nautilus
+        order in the list if the single MT5 request cannot be sent.
+        """
+        reject_orders = [order] if reject_orders is None else reject_orders
         symbol = order.instrument_id.symbol.value
 
         self._conn.ensure_connected()
 
         instrument = self._provider.get_instrument(symbol)
         if instrument is None:
-            self._generate_order_rejected(
-                order, f"Instrument not found for symbol '{symbol}'"
+            self._reject_orders(
+                reject_orders,
+                f"Instrument not found for symbol '{symbol}'",
             )
             return
 
-        # ── Build the MT5 trade request ───────────────────────────────────
-
-        # Get current price for market orders
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
-            self._generate_order_rejected(order, f"Cannot get price for '{symbol}'")
+            self._reject_orders(reject_orders, f"Cannot get price for '{symbol}'")
             return
 
-        price = float(order.price) if hasattr(order, "price") and order.price else 0.0
-        sl    = float(order.trigger_price) if hasattr(order, "trigger_price") and order.trigger_price else 0.0
+        result = self._send_with_filling_retry(
+            order=order,
+            tick=tick,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            reject_orders=reject_orders,
+        )
+        if result is None:
+            return
 
-        # For stop-limit: price = limit price, stoplimit_price = stop trigger
-        stoplimit_price = 0.0
-        if order.order_type == OrderType.STOP_LIMIT:
-            stoplimit_price = price
-            price = float(order.trigger_price) if order.trigger_price else 0.0
+        ticket = result.order
+        self._record_submitted_order(order, ticket)
 
-        # Market order: use current ask/bid
-        if order.order_type == OrderType.MARKET:
-            price = tick.ask if order.side == OrderSide.BUY else tick.bid
-            action    = mt5.TRADE_ACTION_DEAL
-            mt5_order_type = _nautilus_side_to_mt5_market(order.side)
-        else:
-            action    = mt5.TRADE_ACTION_PENDING
-            mt5_order_type = _nautilus_order_to_mt5_pending(order.order_type, order.side)
+        self._log.info(
+            f"MT5LiveExecutionClient: order sent "
+            f"ticket={ticket} client_order_id={order.client_order_id} "
+            f"retcode={result.retcode}"
+        )
 
-        # ── Try different filling modes (for compatibility with Exness and other brokers) ──
-        # Some symbols (like XAUUSD on Exness) don't support ORDER_FILLING_IOC
+        # NautilusTrader will receive fill reports from the polling loop.
+        # For now just emit OrderAccepted.
+        self._generate_order_accepted(order, VenueOrderId(str(ticket)))
+
+    def _send_with_filling_retry(
+        self,
+        order: Any,
+        tick: Any,
+        sl_price: float | None,
+        tp_price: float | None,
+        reject_orders: list[Any],
+    ) -> Any | None:
+        """Send an MT5 request, retrying alternate filling modes when needed."""
         filling_modes = [
             mt5.ORDER_FILLING_IOC,      # Immediate or Cancel (preferred)
             mt5.ORDER_FILLING_RETURN,   # Return (FOK equivalent)
             mt5.ORDER_FILLING_FOK,      # Fill or Kill
         ]
-        
-        last_error = None
+
         result = None
-        
+
         for fill_mode in filling_modes:
-            # Build request dict
-            request = {
-                "action":       action,
-                "symbol":       symbol,
-                "volume":       float(order.quantity),
-                "type":         mt5_order_type,
-                "price":        price,
-                "sl":           0.0,      # set below if order has sl
-                "tp":           0.0,      # set below if order has tp
-                "deviation":    20,       # max price deviation (points) for market orders
-                "magic":        self._config.magic_number,
-                "comment":      str(order.client_order_id),
-                "type_filling": fill_mode,
-                "type_time":    _time_in_force_to_mt5(order.time_in_force),
-            }
-
-            if stoplimit_price:
-                request["stoplimit"] = stoplimit_price
-
-            # Attach SL/TP if the order carries them
-            if hasattr(order, "sl_trigger_price") and order.sl_trigger_price:
-                request["sl"] = float(order.sl_trigger_price)
-            if hasattr(order, "tp_price") and order.tp_price:
-                request["tp"] = float(order.tp_price)
-
-            # Send to MT5
+            request = self._build_mt5_order_request(
+                order=order,
+                tick=tick,
+                fill_mode=fill_mode,
+                sl_price=sl_price,
+                tp_price=tp_price,
+            )
             result = mt5.order_send(request)
-            
+
             if result is not None:
-                # Success
-                if result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED,
-                                       mt5.TRADE_RETCODE_DONE_PARTIAL, 10008):
+                if self._is_success_retcode(result.retcode):
                     break
-                # Unsupported filling mode - try next one
                 if result.retcode == 10030:
-                    last_error = result
                     continue
-                # Other error - stop trying
-                last_error = result
                 break
-            else:
-                last_error = None
-                code, msg = mt5.last_error()
-                self._log.error(f"order_send returned None: error {code}: {msg}")
-                self._generate_order_rejected(order, f"order_send returned None — error {code}: {msg}")
-                return
 
-        # Check final result
+            code, msg = mt5.last_error()
+            self._log.error(f"order_send returned None: error {code}: {msg}")
+            self._reject_orders(
+                reject_orders,
+                f"order_send returned None — error {code}: {msg}",
+            )
+            return None
+
         if result is None:
-            self._generate_order_rejected(order, "order_send returned None")
-            return
+            self._reject_orders(reject_orders, "order_send returned None")
+            return None
 
-        if result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED,
-                                   mt5.TRADE_RETCODE_DONE_PARTIAL, 10008):
+        if not self._is_success_retcode(result.retcode):
             reason = _mt5_retcode_to_str(result.retcode)
-            self._generate_order_rejected(
-                order,
+            self._reject_orders(
+                reject_orders,
                 f"MT5 rejected order: {reason} (retcode={result.retcode})"
             )
-            return
+            return None
 
-        # ── Success — record the ticket ───────────────────────────────────
+        return result
 
-        ticket = result.order
+    def _build_mt5_order_request(
+        self,
+        order: Any,
+        tick: Any,
+        fill_mode: int,
+        sl_price: float | None = None,
+        tp_price: float | None = None,
+    ) -> dict[str, Any]:
+        """Build an MT5 order_send request for a Nautilus order."""
+        symbol = order.instrument_id.symbol.value
+        price = float(order.price) if hasattr(order, "price") and order.price else 0.0
+
+        stoplimit_price = 0.0
+        if order.order_type == OrderType.STOP_LIMIT:
+            stoplimit_price = price
+            price = float(order.trigger_price) if order.trigger_price else 0.0
+
+        if order.order_type == OrderType.MARKET:
+            price = tick.ask if order.side == OrderSide.BUY else tick.bid
+            action = mt5.TRADE_ACTION_DEAL
+            mt5_order_type = _nautilus_side_to_mt5_market(order.side)
+        else:
+            action = mt5.TRADE_ACTION_PENDING
+            mt5_order_type = _nautilus_order_to_mt5_pending(order.order_type, order.side)
+
+        request_sl = (
+            sl_price
+            if sl_price is not None
+            else self._extract_price_value(order, "sl_trigger_price")
+        )
+        request_tp = (
+            tp_price
+            if tp_price is not None
+            else self._extract_price_value(order, "tp_price")
+        )
+
+        request = {
+            "action":       action,
+            "symbol":       symbol,
+            "volume":       float(order.quantity),
+            "type":         mt5_order_type,
+            "price":        price,
+            "sl":           request_sl or 0.0,
+            "tp":           request_tp or 0.0,
+            "deviation":    20,       # max price deviation (points) for market orders
+            "magic":        self._config.magic_number,
+            "comment":      str(order.client_order_id),
+            "type_filling": fill_mode,
+            "type_time":    _time_in_force_to_mt5(order.time_in_force),
+        }
+
+        if stoplimit_price:
+            request["stoplimit"] = stoplimit_price
+
+        return request
+
+    def _extract_simple_bracket(
+        self,
+        orders: list[Any],
+    ) -> tuple[Any | None, float | None, float | None, str | None]:
+        """Return entry/sl/tp for the narrow MT5-native bracket shape."""
+        entry_orders = [
+            order for order in orders
+            if order.order_type == OrderType.MARKET
+        ]
+        if len(entry_orders) != 1:
+            return (
+                None,
+                None,
+                None,
+                "Unsupported order list: expected exactly one market entry order",
+            )
+
+        entry_order = entry_orders[0]
+        if self._parent_order_id(entry_order) is not None:
+            return (
+                None,
+                None,
+                None,
+                "Unsupported order list: market entry order cannot be a child order",
+            )
+
+        entry_instrument_id = entry_order.instrument_id
+        if any(order.instrument_id != entry_instrument_id for order in orders):
+            return None, None, None, "Unsupported order list: mixed instruments"
+
+        if entry_order.side == OrderSide.BUY:
+            expected_child_side = OrderSide.SELL
+        elif entry_order.side == OrderSide.SELL:
+            expected_child_side = OrderSide.BUY
+        else:
+            return None, None, None, "Unsupported order list: entry side must be BUY or SELL"
+
+        sl_price = None
+        tp_price = None
+        for child_order in (order for order in orders if order is not entry_order):
+            parent_order_id = self._parent_order_id(child_order)
+            if parent_order_id is None or str(parent_order_id) != str(entry_order.client_order_id):
+                return (
+                    None,
+                    None,
+                    None,
+                    "Unsupported order list: protective child must reference entry order",
+                )
+            if child_order.side != expected_child_side:
+                return (
+                    None,
+                    None,
+                    None,
+                    "Unsupported order list: protective child side must oppose entry side",
+                )
+            if child_order.quantity != entry_order.quantity:
+                return (
+                    None,
+                    None,
+                    None,
+                    "Unsupported order list: protective child quantity must match entry quantity",
+                )
+
+            if child_order.order_type == OrderType.STOP_MARKET:
+                if sl_price is not None:
+                    return None, None, None, "Unsupported order list: multiple stop-loss children"
+                sl_price = self._extract_price_value(child_order, "trigger_price")
+                if sl_price is None or sl_price <= 0.0:
+                    return (
+                        None,
+                        None,
+                        None,
+                        "Unsupported order list: stop-loss child missing trigger price",
+                    )
+            elif child_order.order_type == OrderType.LIMIT:
+                if tp_price is not None:
+                    return None, None, None, "Unsupported order list: multiple take-profit children"
+                tp_price = self._extract_price_value(child_order, "price")
+                if tp_price is None or tp_price <= 0.0:
+                    return (
+                        None,
+                        None,
+                        None,
+                        "Unsupported order list: take-profit child missing limit price",
+                    )
+            else:
+                order_type = getattr(child_order.order_type, "name", child_order.order_type)
+                return (
+                    None,
+                    None,
+                    None,
+                    f"Unsupported order list: child order type {order_type} is not supported",
+                )
+
+        return entry_order, sl_price, tp_price, None
+
+    def _record_submitted_order(self, order: Any, ticket: int) -> None:
+        """Store ticket/client-order/strategy ownership maps for a sent order."""
         client_order_id_str = str(order.client_order_id)
         strategy_id_str = str(order.strategy_id)
         self._client_order_id_to_ticket[client_order_id_str] = ticket
@@ -468,15 +653,34 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._client_order_id_to_strategy_id[client_order_id_str] = strategy_id_str
         self._ticket_to_strategy_id[ticket] = strategy_id_str
 
-        self._log.info(
-            f"MT5LiveExecutionClient: order sent "
-            f"ticket={ticket} client_order_id={client_order_id_str} "
-            f"retcode={result.retcode}"
-        )
+    def _reject_orders(self, orders: list[Any], reason: str) -> None:
+        """Emit OrderRejected for every Nautilus order in a failed list."""
+        for order in orders:
+            self._generate_order_rejected(order, reason)
 
-        # NautilusTrader will receive fill reports from the polling loop.
-        # For now just emit OrderAccepted.
-        self._generate_order_accepted(order, VenueOrderId(str(ticket)))
+    def _parent_order_id(self, order: Any) -> Any | None:
+        """Return a normalized parent order ID value."""
+        parent_order_id = getattr(order, "parent_order_id", None)
+        return parent_order_id if parent_order_id else None
+
+    def _extract_price_value(self, order: Any, attr: str) -> float | None:
+        """Safely extract an optional Nautilus Price-like attribute as float."""
+        value = getattr(order, attr, None)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _is_success_retcode(self, retcode: int) -> bool:
+        """Return true when an MT5 order_send retcode represents success."""
+        return retcode in (
+            mt5.TRADE_RETCODE_DONE,
+            mt5.TRADE_RETCODE_PLACED,
+            mt5.TRADE_RETCODE_DONE_PARTIAL,
+            10008,
+        )
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         """

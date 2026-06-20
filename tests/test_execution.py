@@ -216,7 +216,75 @@ def make_mock_order(client_order_id="O-001", symbol="EURUSD",
     order.trigger_price   = None
     order.sl_trigger_price = None
     order.tp_price        = None
+    order.parent_order_id = None
+    order.linked_order_ids = []
+    order.is_child_order = False
     return order
+
+
+def make_order_list_command(orders):
+    order_list = MagicMock()
+    order_list.orders = orders
+    cmd = MagicMock()
+    cmd.order_list = order_list
+    return cmd
+
+
+def make_mock_bracket_order_list(
+    client_order_id="O-BRACKET-ENTRY",
+    symbol="EURUSD",
+    side=OrderSide.BUY,
+    qty=0.10,
+    strategy_id="S-001",
+    stop_loss=True,
+    take_profit=True,
+    sl_price=1.08000,
+    tp_price=1.09000,
+):
+    entry = make_mock_order(
+        client_order_id=client_order_id,
+        symbol=symbol,
+        order_type=OrderType.MARKET,
+        side=side,
+        qty=qty,
+        strategy_id=strategy_id,
+    )
+    exit_side = OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
+    orders = [entry]
+    stop_order = None
+    tp_order = None
+
+    if stop_loss:
+        stop_order = make_mock_order(
+            client_order_id="O-BRACKET-SL",
+            symbol=symbol,
+            order_type=OrderType.STOP_MARKET,
+            side=exit_side,
+            qty=qty,
+            strategy_id=strategy_id,
+        )
+        stop_order.price = None
+        stop_order.trigger_price = Price(sl_price, 5) if sl_price is not None else None
+        stop_order.parent_order_id = entry.client_order_id
+        stop_order.is_child_order = True
+        orders.append(stop_order)
+
+    if take_profit:
+        tp_order = make_mock_order(
+            client_order_id="O-BRACKET-TP",
+            symbol=symbol,
+            order_type=OrderType.LIMIT,
+            side=exit_side,
+            qty=qty,
+            price=tp_price if tp_price is not None else 1.09000,
+            strategy_id=strategy_id,
+        )
+        tp_order.price = Price(tp_price, 5) if tp_price is not None else None
+        tp_order.parent_order_id = entry.client_order_id
+        tp_order.is_child_order = True
+        orders.append(tp_order)
+
+    return make_order_list_command(orders), entry, stop_order, tp_order
 
 
 def make_provider(instrument=None):
@@ -572,6 +640,156 @@ class TestSubmitMarketOrder:
 
         req = mock_mt5_exec.order_send.call_args[0][0]
         assert req["magic"] == config.magic_number
+
+    @pytest.mark.asyncio
+    async def test_direct_order_sends_sl_tp_fields(self, config, mock_mt5_exec):
+        client = make_exec_client(config, mock_mt5_exec)
+        order = make_mock_order()
+        order.sl_trigger_price = Price(1.08000, 5)
+        order.tp_price = Price(1.09000, 5)
+        cmd = MagicMock()
+        cmd.order = order
+
+        await client._submit_order(cmd)
+
+        req = mock_mt5_exec.order_send.call_args[0][0]
+        assert req["sl"] == pytest.approx(1.08000)
+        assert req["tp"] == pytest.approx(1.09000)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5b. SUBMIT ORDER LIST — SIMPLE BRACKET SL/TP
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSubmitOrderListBracket:
+    @pytest.mark.asyncio
+    async def test_simple_market_bracket_sends_single_request_with_sl_tp(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        client = make_exec_client(config, mock_mt5_exec)
+        cmd, entry, _, _ = make_mock_bracket_order_list()
+
+        await client._submit_order_list(cmd)
+
+        mock_mt5_exec.order_send.assert_called_once()
+        req = mock_mt5_exec.order_send.call_args[0][0]
+        assert req["action"] == mock_mt5_exec.TRADE_ACTION_DEAL
+        assert req["type"] == mock_mt5_exec.ORDER_TYPE_BUY
+        assert req["comment"] == str(entry.client_order_id)
+        assert req["sl"] == pytest.approx(1.08000)
+        assert req["tp"] == pytest.approx(1.09000)
+
+    @pytest.mark.asyncio
+    async def test_market_bracket_with_only_stop_loss_sets_tp_zero(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        client = make_exec_client(config, mock_mt5_exec)
+        cmd, _, _, _ = make_mock_bracket_order_list(take_profit=False)
+
+        await client._submit_order_list(cmd)
+
+        req = mock_mt5_exec.order_send.call_args[0][0]
+        assert req["sl"] == pytest.approx(1.08000)
+        assert req["tp"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_market_bracket_with_only_take_profit_sets_sl_zero(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        client = make_exec_client(config, mock_mt5_exec)
+        cmd, _, _, _ = make_mock_bracket_order_list(stop_loss=False)
+
+        await client._submit_order_list(cmd)
+
+        req = mock_mt5_exec.order_send.call_args[0][0]
+        assert req["sl"] == 0.0
+        assert req["tp"] == pytest.approx(1.09000)
+
+    @pytest.mark.asyncio
+    async def test_bracket_entry_records_ticket_and_strategy_id(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        client = make_exec_client(config, mock_mt5_exec)
+        cmd, entry, _, _ = make_mock_bracket_order_list(
+            client_order_id="O-BRACKET-ENTRY",
+            strategy_id="Strategy-007",
+        )
+
+        await client._submit_order_list(cmd)
+
+        entry_client_order_id = str(entry.client_order_id)
+        assert client._client_order_id_to_ticket[entry_client_order_id] == 99991
+        assert client._ticket_to_client_order_id[99991] == entry_client_order_id
+        assert client._client_order_id_to_strategy_id[entry_client_order_id] == "Strategy-007"
+        assert client._ticket_to_strategy_id[99991] == "Strategy-007"
+
+    @pytest.mark.asyncio
+    async def test_bracket_retries_unsupported_filling_mode(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        unsupported = MagicMock()
+        unsupported.retcode = 10030
+        unsupported.order = 0
+        success = MagicMock()
+        success.retcode = mock_mt5_exec.TRADE_RETCODE_DONE
+        success.order = 99992
+        mock_mt5_exec.order_send.side_effect = [unsupported, success]
+
+        client = make_exec_client(config, mock_mt5_exec)
+        cmd, _, _, _ = make_mock_bracket_order_list()
+
+        await client._submit_order_list(cmd)
+
+        assert mock_mt5_exec.order_send.call_count == 2
+        first_req = mock_mt5_exec.order_send.call_args_list[0].args[0]
+        second_req = mock_mt5_exec.order_send.call_args_list[1].args[0]
+        assert first_req["type_filling"] == mock_mt5_exec.ORDER_FILLING_IOC
+        assert second_req["type_filling"] == mock_mt5_exec.ORDER_FILLING_RETURN
+        client.generate_order_accepted.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_multiple_entries_rejected_without_order_send(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        client = make_exec_client(config, mock_mt5_exec)
+        entry_a = make_mock_order(client_order_id="O-ENTRY-A")
+        entry_b = make_mock_order(client_order_id="O-ENTRY-B")
+        cmd = make_order_list_command([entry_a, entry_b])
+
+        await client._submit_order_list(cmd)
+
+        mock_mt5_exec.order_send.assert_not_called()
+        assert client.generate_order_rejected.call_count == 2
+        reason = client.generate_order_rejected.call_args_list[0].kwargs["reason"]
+        assert "exactly one market entry" in reason
+
+    @pytest.mark.asyncio
+    async def test_missing_protective_price_rejected_without_order_send(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        client = make_exec_client(config, mock_mt5_exec)
+        cmd, _, _, _ = make_mock_bracket_order_list(sl_price=None)
+
+        await client._submit_order_list(cmd)
+
+        mock_mt5_exec.order_send.assert_not_called()
+        assert client.generate_order_rejected.called
+        reason = client.generate_order_rejected.call_args_list[0].kwargs["reason"]
+        assert "stop-loss child missing trigger price" in reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────
