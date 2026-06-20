@@ -58,6 +58,7 @@ from nautilus_trader.model.identifiers import (
     ClientId,
     ClientOrderId,
     InstrumentId,
+    StrategyId,
     Symbol,
     VenueOrderId,
 )
@@ -78,6 +79,8 @@ from mt5connect.execution import (
 
 UTC = timezone.utc
 MAGIC = 510
+STRATEGY_ID = StrategyId("S-001")
+ALT_STRATEGY_ID = StrategyId("ALT-001")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,10 +197,10 @@ def make_instrument(symbol="EURUSD"):
 
 def make_mock_order(client_order_id="O-001", symbol="EURUSD",
                     order_type=OrderType.MARKET, side=OrderSide.BUY,
-                    qty=0.10, price=1.08500):
+                    qty=0.10, price=1.08500, strategy_id=STRATEGY_ID):
     order = MagicMock()
     order.client_order_id = ClientOrderId(client_order_id)
-    order.strategy_id     = MagicMock()
+    order.strategy_id     = strategy_id
     order.instrument_id   = InstrumentId.from_str(f"{symbol}.MT5")
     order.order_type      = order_type
     order.side            = side
@@ -212,6 +215,40 @@ def make_mock_order(client_order_id="O-001", symbol="EURUSD",
     order.sl_trigger_price = None
     order.tp_price        = None
     return order
+
+
+def register_fill_owner(
+    client,
+    order_ticket=99991,
+    client_order_id="O-001",
+    strategy_id=STRATEGY_ID,
+):
+    """Seed the session ownership maps required for live fill emission."""
+    client._client_order_id_to_ticket[client_order_id] = order_ticket
+    client._ticket_to_client_order_id[order_ticket] = client_order_id
+    client._client_order_id_to_strategy_id[client_order_id] = str(strategy_id)
+    client._ticket_to_strategy_id[order_ticket] = str(strategy_id)
+
+
+def generated_fill_args(client):
+    """Return positional generate_order_filled args by semantic name."""
+    args = client.generate_order_filled.call_args[0]
+    return {
+        "strategy_id": args[0],
+        "instrument_id": args[1],
+        "client_order_id": args[2],
+        "venue_order_id": args[3],
+        "venue_position_id": args[4],
+        "trade_id": args[5],
+        "order_side": args[6],
+        "order_type": args[7],
+        "last_qty": args[8],
+        "last_px": args[9],
+        "quote_currency": args[10],
+        "commission": args[11],
+        "liquidity_side": args[12],
+        "ts_event": args[13],
+    }
 
 
 def make_provider(instrument=None):
@@ -384,6 +421,11 @@ class TestInitialState:
         client = make_exec_client(config, mock_mt5_exec)
         assert len(client._client_order_id_to_ticket) == 0
 
+    def test_strategy_id_maps_empty(self, config, mock_mt5_exec):
+        client = make_exec_client(config, mock_mt5_exec)
+        assert len(client._client_order_id_to_strategy_id) == 0
+        assert len(client._ticket_to_strategy_id) == 0
+
     def test_not_polling_initially(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
         assert client.is_polling is False
@@ -451,10 +493,16 @@ class TestDisconnect:
         client._known_order_tickets.add(111)
         client._known_position_tickets.add(222)
         client._client_order_id_to_ticket["O-1"] = 111
+        client._ticket_to_client_order_id[111] = "O-1"
+        client._client_order_id_to_strategy_id["O-1"] = str(STRATEGY_ID)
+        client._ticket_to_strategy_id[111] = str(STRATEGY_ID)
         await client._disconnect()
         assert len(client._known_order_tickets) == 0
         assert len(client._known_position_tickets) == 0
         assert len(client._client_order_id_to_ticket) == 0
+        assert len(client._ticket_to_client_order_id) == 0
+        assert len(client._client_order_id_to_strategy_id) == 0
+        assert len(client._ticket_to_strategy_id) == 0
 
     @pytest.mark.asyncio
     async def test_disconnect_sets_poll_task_none(self, config, mock_mt5_exec):
@@ -518,6 +566,19 @@ class TestSubmitMarketOrder:
 
         assert "O-MKTBUY" in client._client_order_id_to_ticket
         assert client._client_order_id_to_ticket["O-MKTBUY"] == 99991
+        assert client._ticket_to_client_order_id[99991] == "O-MKTBUY"
+
+    @pytest.mark.asyncio
+    async def test_market_order_records_strategy_id(self, config, mock_mt5_exec):
+        client = make_exec_client(config, mock_mt5_exec)
+        order  = make_mock_order(client_order_id="O-MKTBUY", strategy_id=ALT_STRATEGY_ID)
+        cmd    = MagicMock()
+        cmd.order = order
+
+        await client._submit_order(cmd)
+
+        assert client._client_order_id_to_strategy_id["O-MKTBUY"] == str(ALT_STRATEGY_ID)
+        assert client._ticket_to_strategy_id[99991] == str(ALT_STRATEGY_ID)
 
     @pytest.mark.asyncio
     async def test_market_order_emits_accepted(self, config, mock_mt5_exec):
@@ -1096,7 +1157,7 @@ class TestProperties:
 #   C. _emit_fill — skips zero-volume deals
 #   D. _emit_fill — skips unknown instrument
 #   E. _emit_fill — recovers ClientOrderId from session map
-#   F. _emit_fill — synthesises ClientOrderId for orders from previous session
+#   F. _emit_fill — skips orders without recoverable ownership
 #   G. _emit_fill — commission sign (negative MT5 → positive Money)
 #   H. _emit_fill — generate_order_filled exception does not crash loop
 #   I. _poll_exec_once — new deal triggers _emit_fill
@@ -1144,6 +1205,7 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(deal_type=mock_mt5_exec.DEAL_TYPE_BUY)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
         client.generate_order_filled.assert_called_once()
@@ -1154,6 +1216,7 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(deal_type=mock_mt5_exec.DEAL_TYPE_SELL)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
         client.generate_order_filled.assert_called_once()
@@ -1165,10 +1228,11 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(deal_type=mock_mt5_exec.DEAL_TYPE_BUY)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert kwargs["order_side"] == OrderSide.BUY
+        args = generated_fill_args(client)
+        assert args["order_side"] == OrderSide.BUY
 
     @pytest.mark.asyncio
     async def test_order_side_is_sell_for_sell_deal(self, config, mock_mt5_exec):
@@ -1177,10 +1241,11 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(deal_type=mock_mt5_exec.DEAL_TYPE_SELL)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert kwargs["order_side"] == OrderSide.SELL
+        args = generated_fill_args(client)
+        assert args["order_side"] == OrderSide.SELL
 
     @pytest.mark.asyncio
     async def test_price_and_quantity_passed_correctly(self, config, mock_mt5_exec):
@@ -1189,11 +1254,12 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(price=1.08520, volume=0.25)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert float(kwargs["last_px"])  == pytest.approx(1.08520, abs=1e-5)
-        assert float(kwargs["last_qty"]) == pytest.approx(0.25,    abs=1e-4)
+        args = generated_fill_args(client)
+        assert float(args["last_px"])  == pytest.approx(1.08520, abs=1e-5)
+        assert float(args["last_qty"]) == pytest.approx(0.25,    abs=1e-4)
 
     @pytest.mark.asyncio
     async def test_commission_made_positive(self, config, mock_mt5_exec):
@@ -1202,10 +1268,11 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(commission=-1.50)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert float(kwargs["commission"]) == pytest.approx(1.50)
+        args = generated_fill_args(client)
+        assert float(args["commission"]) == pytest.approx(1.50)
 
     @pytest.mark.asyncio
     async def test_zero_commission_handled(self, config, mock_mt5_exec):
@@ -1213,10 +1280,11 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(commission=0.0)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert float(kwargs["commission"]) == pytest.approx(0.0)
+        args = generated_fill_args(client)
+        assert float(args["commission"]) == pytest.approx(0.0)
 
     @pytest.mark.asyncio
     async def test_trade_id_is_deal_ticket(self, config, mock_mt5_exec):
@@ -1225,10 +1293,11 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(ticket=77771)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert kwargs["trade_id"] == TradeId("77771")
+        args = generated_fill_args(client)
+        assert args["trade_id"] == TradeId("77771")
 
     @pytest.mark.asyncio
     async def test_venue_order_id_is_order_ticket(self, config, mock_mt5_exec):
@@ -1237,10 +1306,11 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(order=88881)
+        register_fill_owner(client, order_ticket=88881)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert kwargs["venue_order_id"] == VenueOrderId("88881")
+        args = generated_fill_args(client)
+        assert args["venue_order_id"] == VenueOrderId("88881")
 
     @pytest.mark.asyncio
     async def test_client_order_id_recovered_from_session_map(self, config, mock_mt5_exec):
@@ -1248,28 +1318,67 @@ class TestEmitFill:
         from nautilus_trader.model.identifiers import ClientOrderId
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
-        client._ticket_to_client_order_id[88881] = "O-SESSION-123"
+
+        deal = make_deal(order=88881)
+        register_fill_owner(client, order_ticket=88881, client_order_id="O-SESSION-123")
+        await client._emit_fill(deal)
+
+        args = generated_fill_args(client)
+        assert args["client_order_id"] == ClientOrderId("O-SESSION-123")
+
+    @pytest.mark.asyncio
+    async def test_strategy_id_recovered_from_session_map(self, config, mock_mt5_exec):
+        """If we placed the order this session, the StrategyId should come from our map."""
+        client = make_exec_client(config, mock_mt5_exec)
+        client.generate_order_filled = MagicMock()
+
+        deal = make_deal(order=88881)
+        register_fill_owner(
+            client,
+            order_ticket=88881,
+            client_order_id="O-SESSION-123",
+            strategy_id=ALT_STRATEGY_ID,
+        )
+        await client._emit_fill(deal)
+
+        args = generated_fill_args(client)
+        assert args["strategy_id"] == ALT_STRATEGY_ID
+
+    @pytest.mark.asyncio
+    async def test_strategy_id_falls_back_to_client_order_id_map(self, config, mock_mt5_exec):
+        client = make_exec_client(config, mock_mt5_exec)
+        client.generate_order_filled = MagicMock()
+        client_order_id = "O-SESSION-123"
+        client._ticket_to_client_order_id[88881] = client_order_id
+        client._client_order_id_to_strategy_id[client_order_id] = str(ALT_STRATEGY_ID)
 
         deal = make_deal(order=88881)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert kwargs["client_order_id"] == ClientOrderId("O-SESSION-123")
+        args = generated_fill_args(client)
+        assert args["strategy_id"] == ALT_STRATEGY_ID
 
     @pytest.mark.asyncio
-    async def test_client_order_id_synthesised_for_previous_session(self, config, mock_mt5_exec):
-        """Orders placed in a previous session have no entry in the map.
-        We synthesise MT5-{ticket} so NT still tracks the fill."""
-        from nautilus_trader.model.identifiers import ClientOrderId
+    async def test_unowned_deal_without_client_order_id_skipped(self, config, mock_mt5_exec):
+        """Orders placed externally or in previous sessions should not emit live fills."""
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
-        # ticket 55551 not in map — simulates order from previous session
 
         deal = make_deal(order=55551)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert kwargs["client_order_id"] == ClientOrderId("MT5-55551")
+        client.generate_order_filled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deal_without_strategy_id_skipped(self, config, mock_mt5_exec):
+        client = make_exec_client(config, mock_mt5_exec)
+        client.generate_order_filled = MagicMock()
+        client._ticket_to_client_order_id[99991] = "O-NO-STRATEGY"
+
+        deal = make_deal(order=99991)
+        await client._emit_fill(deal)
+
+        client.generate_order_filled.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_trade_deal_type_skipped(self, config, mock_mt5_exec):
@@ -1279,6 +1388,7 @@ class TestEmitFill:
 
         # deal.type = 2 → DEAL_TYPE_BALANCE (not BUY=0 or SELL=1)
         deal = make_deal(deal_type=2)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
         client.generate_order_filled.assert_not_called()
@@ -1290,6 +1400,7 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(volume=0.0)
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
         client.generate_order_filled.assert_not_called()
@@ -1302,6 +1413,7 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(symbol="UNKNOWNSYMBOL")
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
         client.generate_order_filled.assert_not_called()
@@ -1313,6 +1425,7 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock(side_effect=RuntimeError("NT error"))
 
         deal = make_deal()
+        register_fill_owner(client, order_ticket=deal.order)
         # Should not raise
         await client._emit_fill(deal)
 
@@ -1323,10 +1436,11 @@ class TestEmitFill:
         client.generate_order_filled = MagicMock()
 
         deal = make_deal(symbol="EURUSD")
+        register_fill_owner(client, order_ticket=deal.order)
         await client._emit_fill(deal)
 
-        kwargs = client.generate_order_filled.call_args[1]
-        assert kwargs["instrument_id"] == InstrumentId.from_str("EURUSD.MT5")
+        args = generated_fill_args(client)
+        assert args["instrument_id"] == InstrumentId.from_str("EURUSD.MT5")
 
 
 class TestPollExecOnceFills:
