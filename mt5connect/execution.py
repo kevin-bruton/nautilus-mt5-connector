@@ -80,6 +80,7 @@ from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
     Symbol,
+    StrategyId,
     TradeId,
     VenueOrderId,
 )
@@ -269,6 +270,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         # Reverse map: MT5 ticket → ClientOrderId string
         self._ticket_to_client_order_id: dict[int, str] = {}
 
+        # Strategy ownership maps preserve Nautilus attribution for fills.
+        self._client_order_id_to_strategy_id: dict[str, str] = {}
+        self._ticket_to_strategy_id: dict[int, str] = {}
+
     # ── Required: connect / disconnect ───────────────────────────────────────
 
     async def _connect(self) -> None:
@@ -322,6 +327,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._known_position_tickets.clear()
         self._client_order_id_to_ticket.clear()
         self._ticket_to_client_order_id.clear()
+        self._client_order_id_to_strategy_id.clear()
+        self._ticket_to_strategy_id.clear()
         self._processed_deal_keys.clear()
         self._log.info("MT5LiveExecutionClient: disconnected")
 
@@ -455,8 +462,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
         ticket = result.order
         client_order_id_str = str(order.client_order_id)
+        strategy_id_str = str(order.strategy_id)
         self._client_order_id_to_ticket[client_order_id_str] = ticket
         self._ticket_to_client_order_id[ticket] = client_order_id_str
+        self._client_order_id_to_strategy_id[client_order_id_str] = strategy_id_str
+        self._ticket_to_strategy_id[ticket] = strategy_id_str
 
         self._log.info(
             f"MT5LiveExecutionClient: order sent "
@@ -928,11 +938,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         pp = instrument.price_precision
         sp = instrument.size_precision
 
-        # Recover ClientOrderId for orders owned by this client session.
+        # Recover ownership details for orders submitted by this client session.
         client_order_id_str = self._ticket_to_client_order_id.get(deal.order)
-        if client_order_id_str:
-            client_order_id = ClientOrderId(client_order_id_str)
-        else:
+        if client_order_id_str is None:
             # Order placed in a previous session or externally — NT has no record
             # of this order, so pushing generate_order_filled would produce:
             #   WARN  Order not found in cache to apply OrderFilled(...)
@@ -945,6 +953,17 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             )
             return
 
+        strategy_id_str = self._ticket_to_strategy_id.get(deal.order)
+        if strategy_id_str is None:
+            strategy_id_str = self._client_order_id_to_strategy_id.get(client_order_id_str)
+        if strategy_id_str is None:
+            self._log.debug(
+                f"MT5LiveExecutionClient: deal {deal.ticket} (order={deal.order}) "
+                "has no NT strategy_id — skipping fill emission for unowned order"
+            )
+            return
+
+        client_order_id = ClientOrderId(client_order_id_str)
         venue_order_id = VenueOrderId(str(deal.order))
         trade_id       = TradeId(str(deal.ticket))
 
@@ -970,8 +989,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             #  venue_position_id, trade_id, order_side, order_type, last_qty,
             #  last_px, quote_currency, commission, liquidity_side, ts_event, info=None)
             # Must be called positionally — kwargs not accepted by the Cython binding.
-            from nautilus_trader.model.identifiers import StrategyId
-            strategy_id = getattr(self, "_strategy_id", None) or StrategyId("UNSPECIFIED-000")
+            strategy_id = StrategyId(strategy_id_str)
             self.generate_order_filled(
                 strategy_id,                                   # strategy_id
                 InstrumentId(Symbol(symbol), MT5_VENUE),       # instrument_id
