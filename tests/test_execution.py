@@ -42,6 +42,7 @@ import asyncio
 import pytest
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import MetaTrader5 as mt5
@@ -51,6 +52,7 @@ from nautilus_trader.model.enums import (
     OrderSide,
     OrderStatus,
     OrderType,
+    OmsType,
     TimeInForce,
 )
 from nautilus_trader.model.identifiers import (
@@ -58,6 +60,7 @@ from nautilus_trader.model.identifiers import (
     ClientId,
     ClientOrderId,
     InstrumentId,
+    PositionId,
     Symbol,
     StrategyId,
     VenueOrderId,
@@ -465,6 +468,31 @@ class TestInitialState:
     def test_not_polling_initially(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
         assert client.is_polling is False
+
+    def test_default_config_uses_netting_oms(self, config, mock_mt5_exec):
+        client = make_exec_client(config, mock_mt5_exec)
+        assert client.oms_type == OmsType.NETTING
+
+    def test_hedging_config_uses_hedging_oms(self, config, mock_mt5_exec):
+        from mt5connect.config import MT5Config
+
+        hedging_config = MT5Config(
+            account=config.account,
+            password=config.password,
+            server=config.server,
+            symbols=config.symbols,
+            exec_poll_interval_ms=config.exec_poll_interval_ms,
+            reconnect_initial_delay_s=config.reconnect_initial_delay_s,
+            reconnect_max_delay_s=config.reconnect_max_delay_s,
+            reconnect_max_attempts=config.reconnect_max_attempts,
+            account_mode="hedging",
+        )
+        client = make_exec_client(hedging_config, mock_mt5_exec)
+        assert client.oms_type == OmsType.HEDGING
+
+    def test_netting_config_uses_netting_oms(self, config, mock_mt5_exec):
+        client = make_exec_client(config, mock_mt5_exec)
+        assert client.oms_type == OmsType.NETTING
 
     def test_known_order_count_zero(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
@@ -1133,6 +1161,7 @@ class TestModifyOrder:
 
         req = mock_mt5_exec.order_send.call_args[0][0]
         assert req["action"] == mock_mt5_exec.TRADE_ACTION_SLTP
+        assert req["position"] == 66661
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1153,6 +1182,27 @@ class TestPollExecOnce:
         assert 12301 in client._known_position_tickets
 
     @pytest.mark.asyncio
+    async def test_same_symbol_hedged_positions_both_tracked(self, config, mock_mt5_exec):
+        long_pos = make_position(
+            ticket=12301,
+            identifier=90001,
+            symbol="EURUSD",
+            position_type=mock_mt5_exec.ORDER_TYPE_BUY,
+        )
+        short_pos = make_position(
+            ticket=12302,
+            identifier=90002,
+            symbol="EURUSD",
+            position_type=mock_mt5_exec.ORDER_TYPE_SELL,
+        )
+        mock_mt5_exec.positions_get.return_value = (long_pos, short_pos)
+
+        client = make_exec_client(config, mock_mt5_exec)
+        await client._poll_exec_once()
+
+        assert client._known_position_tickets == {12301, 12302}
+
+    @pytest.mark.asyncio
     async def test_closed_position_removed_from_known(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
         client._known_position_tickets.add(99991)
@@ -1163,6 +1213,26 @@ class TestPollExecOnce:
         await client._poll_exec_once()
 
         assert 99991 not in client._known_position_tickets
+
+    @pytest.mark.asyncio
+    async def test_same_symbol_hedged_poll_removes_only_missing_ticket(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        remaining_pos = make_position(
+            ticket=12302,
+            identifier=90002,
+            symbol="EURUSD",
+            position_type=mock_mt5_exec.ORDER_TYPE_SELL,
+        )
+        mock_mt5_exec.positions_get.return_value = (remaining_pos,)
+
+        client = make_exec_client(config, mock_mt5_exec)
+        client._known_position_tickets = {12301, 12302}
+        await client._poll_exec_once()
+
+        assert client._known_position_tickets == {12302}
 
     @pytest.mark.asyncio
     async def test_disappeared_order_removed_from_known(self, config, mock_mt5_exec):
@@ -1277,6 +1347,21 @@ class TestReconcile:
         assert 2002 not in client._known_position_tickets
 
     @pytest.mark.asyncio
+    async def test_reconcile_positions_keeps_same_symbol_hedged_tickets_distinct(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        p1 = make_position(ticket=2001, identifier=9001, symbol="EURUSD")
+        p2 = make_position(ticket=2002, identifier=9002, symbol="EURUSD")
+        mock_mt5_exec.positions_get.return_value = (p1, p2)
+
+        client = make_exec_client(config, mock_mt5_exec)
+        await client._reconcile_open_positions()
+
+        assert client._known_position_tickets == {2001, 2002}
+
+    @pytest.mark.asyncio
     async def test_reconcile_orders_none_returns_early(self, config, mock_mt5_exec):
         mock_mt5_exec.orders_get.return_value = None
 
@@ -1295,7 +1380,87 @@ class TestReconcile:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 19. PROPERTIES AND REPR
+# 19. REPORT GENERATORS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestReportGenerators:
+    @pytest.mark.asyncio
+    async def test_generate_position_status_reports_keeps_hedged_positions_distinct(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        long_pos = make_position(
+            ticket=3001,
+            identifier=93001,
+            symbol="EURUSD",
+            position_type=mock_mt5_exec.ORDER_TYPE_BUY,
+        )
+        short_pos = make_position(
+            ticket=3002,
+            identifier=93002,
+            symbol="EURUSD",
+            position_type=mock_mt5_exec.ORDER_TYPE_SELL,
+        )
+        mock_mt5_exec.positions_get.return_value = (long_pos, short_pos)
+
+        client = make_exec_client(config, mock_mt5_exec)
+        reports = await client.generate_position_status_reports(
+            SimpleNamespace(instrument_id=None),
+        )
+
+        assert len(reports) == 2
+        assert {report.venue_position_id for report in reports} == {
+            PositionId("93001"),
+            PositionId("93002"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_generate_position_status_reports_falls_back_to_ticket(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        pos = make_position(
+            ticket=3001,
+            identifier=None,
+            symbol="EURUSD",
+            position_type=mock_mt5_exec.ORDER_TYPE_BUY,
+        )
+        mock_mt5_exec.positions_get.return_value = (pos,)
+
+        client = make_exec_client(config, mock_mt5_exec)
+        reports = await client.generate_position_status_reports(
+            SimpleNamespace(instrument_id=None),
+        )
+
+        assert reports[0].venue_position_id == PositionId("3001")
+
+    @pytest.mark.asyncio
+    async def test_generate_fill_reports_includes_deal_position_id(
+        self,
+        config,
+        mock_mt5_exec,
+    ):
+        deal = make_deal(position_id=94001)
+        mock_mt5_exec.history_deals_get.return_value = (deal,)
+
+        client = make_exec_client(config, mock_mt5_exec)
+        reports = await client.generate_fill_reports(
+            SimpleNamespace(
+                instrument_id=None,
+                venue_order_id=None,
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            ),
+        )
+
+        assert len(reports) == 1
+        assert reports[0].venue_position_id == PositionId("94001")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 20. PROPERTIES AND REPR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestProperties:
@@ -1368,6 +1533,7 @@ def make_deal(
     currency="USD",
     magic=MAGIC,
     time=1_700_000_000,
+    position_id=None,
 ):
     """Build a minimal MT5 deal MagicMock."""
     deal = MagicMock()
@@ -1382,7 +1548,33 @@ def make_deal(
     deal.currency   = currency
     deal.magic      = magic
     deal.time       = time
+    deal.position_id = position_id
     return deal
+
+
+def make_position(
+    ticket=20001,
+    identifier=None,
+    symbol="EURUSD",
+    position_type=0,
+    volume=0.10,
+    magic=MAGIC,
+    time=1_700_000_000,
+    sl=0.0,
+    tp=0.0,
+):
+    """Build a minimal MT5 position object."""
+    return SimpleNamespace(
+        ticket=ticket,
+        identifier=identifier,
+        symbol=symbol,
+        type=position_type,
+        volume=volume,
+        magic=magic,
+        time=time,
+        sl=sl,
+        tp=tp,
+    )
 
 
 FILL_ARG_NAMES = (
@@ -1533,6 +1725,18 @@ class TestEmitFill:
 
         kwargs = captured_fill_args(client)
         assert kwargs["venue_order_id"] == VenueOrderId("88881")
+
+    @pytest.mark.asyncio
+    async def test_venue_position_id_is_deal_position_id(self, config, mock_mt5_exec):
+        client = make_exec_client(config, mock_mt5_exec)
+        client.generate_order_filled = MagicMock()
+
+        deal = make_deal(position_id=456789)
+        register_deal_order(client, deal)
+        await client._emit_fill(deal)
+
+        kwargs = captured_fill_args(client)
+        assert kwargs["venue_position_id"] == PositionId("456789")
 
     @pytest.mark.asyncio
     async def test_client_order_id_recovered_from_session_map(self, config, mock_mt5_exec):

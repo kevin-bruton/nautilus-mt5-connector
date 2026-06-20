@@ -80,6 +80,7 @@ from nautilus_trader.model.identifiers import (
     ClientId,
     ClientOrderId,
     InstrumentId,
+    PositionId,
     Symbol,
     StrategyId,
     TradeId,
@@ -235,7 +236,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             loop=loop,
             client_id=ClientId(MT5_VENUE.value),
             venue=MT5_VENUE,
-            oms_type=OmsType.NETTING,
+            oms_type=(
+                OmsType.HEDGING
+                if config.account_mode == "hedging"
+                else OmsType.NETTING
+            ),
             account_type=AccountType.MARGIN,
             base_currency=None,   # MT5 accounts are multi-currency
             msgbus=msgbus,
@@ -1169,6 +1174,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
         client_order_id = ClientOrderId(client_order_id_str)
         venue_order_id = VenueOrderId(str(deal.order))
+        venue_position_id = _position_id_from_mt5_deal(deal)
         trade_id       = TradeId(str(deal.ticket))
 
         order_side = (
@@ -1199,7 +1205,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 InstrumentId(Symbol(symbol), MT5_VENUE),       # instrument_id
                 client_order_id,                               # client_order_id
                 venue_order_id,                                # venue_order_id
-                None,                                          # venue_position_id
+                venue_position_id,                             # venue_position_id
                 trade_id,                                      # trade_id
                 order_side,                                    # order_side
                 OrderType.MARKET,                              # order_type
@@ -1354,6 +1360,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 continue
 
             pp = instrument.price_precision
+            venue_position_id = _position_id_from_mt5_deal(deal)
 
             # FillReport signature (NT current):
             # (account_id, instrument_id, venue_order_id, trade_id, order_side,
@@ -1375,6 +1382,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 self._clock.timestamp_ns(),                                                   # ts_init
                 None,                                                                         # avg_px
                 client_order_id,                                                              # client_order_id
+                venue_position_id,                                                            # venue_position_id
             )
             reports.append(report)
 
@@ -1406,7 +1414,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             if instrument is None:
                 continue
 
-            pp = instrument.price_precision
+            from nautilus_trader.core.uuid import UUID4
 
             side = OrderSide.BUY if pos.type == mt5.ORDER_TYPE_BUY else OrderSide.SELL
             report = PositionStatusReport(
@@ -1414,9 +1422,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 instrument_id=iid,
                 position_side=_order_side_to_position_side(side),
                 quantity=Quantity(pos.volume, instrument.size_precision),
+                report_id=UUID4(),
                 ts_last=int(pos.time) * 1_000_000_000,
-                report_id=None,
                 ts_init=self._clock.timestamp_ns(),
+                venue_position_id=_position_id_from_mt5_position(pos),
             )
             reports.append(report)
 
@@ -1539,6 +1548,18 @@ def _order_side_to_position_side(side: OrderSide):
     """Convert OrderSide to PositionSide."""
     from nautilus_trader.model.enums import PositionSide
     return PositionSide.LONG if side == OrderSide.BUY else PositionSide.SHORT
+
+
+def _position_id_from_mt5_position(pos) -> PositionId:
+    """Derive a stable Nautilus PositionId from an MT5 open position."""
+    raw = getattr(pos, "identifier", None) or pos.ticket
+    return PositionId(str(raw))
+
+
+def _position_id_from_mt5_deal(deal) -> PositionId | None:
+    """Derive a Nautilus PositionId from an MT5 deal when available."""
+    raw = getattr(deal, "position_id", None)
+    return PositionId(str(raw)) if raw else None
 
 
 def _build_order_status_report(
