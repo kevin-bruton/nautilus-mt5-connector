@@ -446,6 +446,7 @@ mt5_config = MT5Config(
     password = os.environ["MT5_PASSWORD"],
     server   = os.environ["MT5_SERVER"],
     symbols  = os.environ["MT5_SYMBOLS"].split(","),
+    account_mode = "netting",  # or "hedging"
 )
 
 # 2. Configure strategy
@@ -495,6 +496,24 @@ node.trader.add_strategy(instance)     # 3. register strategy instance
 node.build()                           # 4. connect to MT5, load instruments
 node.run()                             # 5. start tick polling and strategy
 ```
+
+### MT5 account modes
+
+`MT5Config.account_mode` controls how Nautilus models positions for the live
+execution client:
+
+- `account_mode="netting"` (default) configures Nautilus with `OmsType.NETTING`.
+  Netting accounts expose one broker position per symbol, which can represent
+  the net result of multiple trading decisions.
+- `account_mode="hedging"` configures Nautilus with `OmsType.HEDGING`. MT5 can
+  hold multiple open positions for the same symbol, including same-side or
+  opposite-side positions. The adapter tracks each position by MT5 ticket for
+  close/modify requests and reports the MT5 position identifier as
+  `venue_position_id` when MT5 provides one.
+
+The `magic_number` remains an adapter ownership tag. It decides which MT5
+orders, deals, and positions belong to this adapter; it is not a per-strategy or
+per-position identifier.
 
 ### Bar types for live trading
 
@@ -609,7 +628,7 @@ Note: `mt5-connector` only installs successfully on Windows. It cannot be instal
 - Always use a **demo account** until you have verified your strategy behaves correctly.
 - The `magic_number` in `MT5Config` (default: `510`) tags every order placed by the adapter. Orders without this magic number are ignored — safe to have the MT5 terminal open and trade manually alongside the bot.
 - Change `magic_number` if you run multiple bots simultaneously to avoid one bot managing the other's positions.
-- The adapter uses netting mode (one position per symbol) matching how MT5 accounts work by default. Hedging accounts are not currently supported.
+- Set `account_mode="hedging"` for MT5 hedging accounts so same-symbol positions remain distinct. Set `account_mode="netting"` for netting accounts where the broker exposes one position per symbol.
 - Past backtest performance does not guarantee live performance. Spreads, slippage, and execution latency differ between backtest and live environments.
 
 ---

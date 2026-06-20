@@ -6,6 +6,8 @@ This is the only file users need to touch to connect their broker.
 """
 
 from dataclasses import dataclass
+from typing import Literal
+
 from mt5connect.constants import (
     DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_EXEC_POLL_INTERVAL_MS,
@@ -58,6 +60,11 @@ class MT5Config:
         Unique order identifier for this bot instance.
         Change if running multiple bots simultaneously.
         Default: 510.
+    account_mode : {"hedging", "netting"}
+        MT5 account position mode. Hedging accounts can hold multiple open
+        positions for the same symbol, so the execution client reports and
+        reconciles positions by MT5 position identity. Netting accounts expose
+        one broker position per symbol. Default: "netting".
     reconnect_initial_delay_s : float
         Seconds before first reconnect attempt. Default: 1.0s.
     reconnect_max_delay_s : float
@@ -104,6 +111,7 @@ class MT5Config:
     poll_interval_ms: int         = DEFAULT_POLL_INTERVAL_MS
     exec_poll_interval_ms: int    = DEFAULT_EXEC_POLL_INTERVAL_MS
     magic_number: int             = MT5_MAGIC_NUMBER
+    account_mode: Literal["hedging", "netting"] = "netting"
     reconnect_initial_delay_s: float = RECONNECT_INITIAL_DELAY_S
     reconnect_max_delay_s: float  = RECONNECT_MAX_DELAY_S
     reconnect_max_attempts: int   = RECONNECT_MAX_ATTEMPTS
@@ -128,6 +136,10 @@ class MT5Config:
             raise ValueError("poll_interval_ms must be at least 10ms.")
         if self.exec_poll_interval_ms < 50:
             raise ValueError("exec_poll_interval_ms must be at least 50ms.")
+        if self.account_mode not in ("hedging", "netting"):
+            raise ValueError(
+                "MT5Config.account_mode must be either 'hedging' or 'netting'."
+            )
 
     @property
     def poll_interval_s(self) -> float:
